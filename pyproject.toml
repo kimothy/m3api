@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "m3api"
+version = "0.1.0"
+description = "Package to work with M3 API's"
+authors = ["Kim Timothy Engh <{ID}+{username}@users.noreply.github.com>"]
+readme = "README.org"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+httpx = "^0.26.0"
+requests = "^2.30.0"
+keyring = "^23.0.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

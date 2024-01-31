@@ -1,0 +1,18 @@
+* m3api
+Package to work with M3 Rest API's and MPD Services.
+
+** Features
+- M3 Rest API (MI)
+- M3 Web Services (MPD)
+- Asynchronous if needed
+  - Synchronous clients using Requests
+  - Async clients using HTTPX
+- Store and retrivive endpoints
+  - Using Keyring
+  - Service URL
+  - Credentials
+- Command line client
+- Coercion
+  - Convert results to plain dicts or to dataclasses
+  - Coercon of data to python types, if needed.
+
