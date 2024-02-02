@@ -1,21 +1,17 @@
-from abc import ABC
 from dataclasses import dataclass, field, make_dataclass
 from httpx import AsyncClient as AsyncSessionX
 from requests import Session
 from requests.auth import HTTPBasicAuth
-from typing import Any, AsyncGenerator, Callable, Iterable, Literal, Optional, TypedDict
+from typing import Any, AsyncGenerator, Callable, Iterable, Literal, Optional, TypedDict, Self
 from zeep import AsyncClient, Client, Settings
 from zeep.transports import Transport, AsyncTransport
+from zeep.cache import SqliteCache
 
 import asyncio
 import httpx
 import keyring
-import logging
 import argparse
 import getpass
-
-
-logger = logging.getLogger('m3api')
 
 
 ################################################################################
@@ -142,45 +138,75 @@ def get_type(field: MIField) -> type:
             raise ValueError(f'Field type {field["type"]} not in ["A", "D","N"]')
 
 
-def make_params(
-    program: str,
-    transaction: str,
-    maxrecs: int = 100,
-    cono: Optional[int] = None,
-    divi: Optional[int] = None,
-    user: Optional[str] = None,
-    returncols: list[str] = [],
-    meta: Optional[bool] = None,
-    **kwargs
-):
+def mapparams(**kwargs):
+    """Maps the input parameters to a dictionary which can be sent to the clients for
+    execution without further modifcation. lowecase keyword arguments are treated as
+    a shorthand for known API inputs. Uppercase keyword arguments are treated as input
+    parameters, and will be sent directly to the API as such. Camel case keywords are
+    sent through to the API as is, without modication.
 
-    if isinstance(returncols, str):
-        returncols = returncols.replace(' ', '').split(',')
+    Known lower case arguments are:
+        cono: int
+        divi: int
+        maxrecs: int
+        program: str
+        transaction: str
+        returncols: str
+        returnmeta: bool|None
+        returnempty: bool
 
-    params = {
-        'Cono': cono,
-        'Divi': divi,
-        'ExcludeEmptyValues': False,
-        'MaxReturnedRecords': maxrecs,
-        'ReturnMetadata': {
-            True: 'MetadataOnly',
-            None: 'MetadataIncluded',
-            False: 'MetadataExcluded'}[meta],
-        'M3User': user,
-        'ReturnColumns': {'ColumnName': returncols},
-        'Program': program,
-        'Transaction': transaction,
-        'MIRecord': MIRecord(
-            RowIndex=0,
-            NameValue=[
-                MINameValue(Name=key, Value=value)
-                for key, value in kwargs.items() if key.isupper()
-            ]
-        )
-    }
+    A ValueError is raised if unknown lower case keyword arguments are passed."""
+    
+    lowercase = {k: v for k, v in kwargs.items() if k.islower()}
+    uppercase = {k: v for k, v in kwargs.items() if k.isupper()}
+    camelcase = kwargs
+    
+    parameters = {}
 
-    params.update({k: v for k, v in kwargs.items() if not k.isupper()})
-    return params
+    if 'cono' in kwargs:
+        cono = kwargs.pop('cono')
+        parameters['Cono'] = cono
+
+    if 'divi' in kwargs:
+        divi = kwargs.pop('divi')
+        parameters['Divi'] = divi
+
+    if 'maxrecs' in kwargs:
+        maxrecs = kwargs.pop('maxrecs')
+        parameters['MaxReturnedRecords'] = int(maxrecs)
+    
+    if 'program' in kwargs:
+        program = kwargs.pop('program')
+        parameters['Program'] = program
+
+    if 'transaction' in kwargs:
+        transaction = kwargs.pop('transaction')
+        parameters['Transaction'] = transaction
+
+    if 'returncols' in kwargs:
+        returncols = {'ColumnName': kwargs.pop('returncols').split(',')}
+        parameters['ReturnColumns'] = returncols
+
+    if 'returnmeta' in kwargs:
+        returnmeta = {True: 'MetadataOnly', None: 'MetadataIncluded', False: 'MetadataExcluded'}[kwargs.pop('returnmeta')]
+        parameters['ReturnMetadata'] = returnmeta
+    
+    if 'returnempty' in kwargs:
+        returnempthy = kwargs.pop('returnempty')
+        parameters['ExcludeEmptyValues'] = not returnempthy
+
+    if any([key.islower() for key in kwargs.keys()]):
+        raise ValueError(f'Unknown lower case parameters passed!: {lowercase}')
+
+    mirecord = [{'RowIndex': 0, 'NameValue': [{'Name': k, 'Value': v} for k, v in uppercase.items()]}]
+    parameters['MIRecord'] = mirecord
+
+    if 'ExcludeEmptyValues' not in parameters:
+        parameters['ExcludeEmptyValues'] = False
+    
+    parameters.update(camelcase)
+
+    return parameters
 
 
 ################################################################################
@@ -188,17 +214,22 @@ def make_params(
 ################################################################################
 
 
-class MIClient:
-    def __init__(self, url, usr, pwd):
-        url = f'{url}/m3api/MIAccess?wsdl'
-        
-        self.session = Session()
-        self.session.auth = HTTPBasicAuth(usr, pwd)
-        self.client = Client(
-            wsdl=url,
-            settings=Settings(strict=True),
-            transport=Transport(session=self.session))
+cache = SqliteCache()
 
+
+class MIClient:    
+    def __init__(self, url, usr, pwd):
+        wsdl = f'{url}/m3api/MIAccess?wsdl'
+        
+        session = Session()
+        session.auth = HTTPBasicAuth(usr, pwd)
+
+        settings = Settings(strict=True)
+        transport = Transport(session=session, cache=cache)
+        client = Client(wsdl=wsdl, settings=settings, transport=transport)
+
+        self.session = session
+        self.client = client
 
     def __enter__(self):
         return self
@@ -209,33 +240,25 @@ class MIClient:
     def close(self):
         self.session.close()
 
-    def execute(
-            self,
-            program: str,
-            transaction: str,
-            maxrecs: int = 100,
-            cono: Optional[int] = None,
-            divi: Optional[int] = None,
-            user: Optional[str] = None,
-            returncols: list[str] = [],
-            meta: Optional[bool] = None,
-            **kwargs
-    ) -> MIResult:
+    def execute(self, program: str, transaction: str, **kwargs) -> MIResult:
+        """Sends a call to the API and returns the result as a dictionary.
 
-        params = make_params(
-            program,
-            transaction,
-            maxrecs,
-            cono,
-            divi,
-            user,
-            returncols,
-            meta,
-            **kwargs)
+        Upper case keyword arguments are considered input parameters.
+        Lower case keyword argumetns are considered known api parameters.
+        Camel case keyword arguments are passed on to the api directly.
 
-        logger.debug(f'{program}:{transaction}:{params}')
-        
-        data = self.client.service['Execute'](params)
+        Known lower case arguments are:
+            cono: int
+            divi: int
+            maxrecs: int
+            program: str
+            transaction: str
+            returncols: str
+            returnmeta: bool|None
+            returnempty: bool
+        """
+        parameters = mapparams(program=program, transaction=transaction, **kwargs)
+        data = self.client.service['Execute'](parameters)
         return data
 
     def progs(self):
@@ -246,12 +269,39 @@ class MIClient:
 
 
 class AsyncMIClient:
-    def __init__(self, url, usr, pwd, semaphore=5):
-        self.session = AsyncSessionX(auth=(usr, pwd))
-        self.client = AsyncClient(
-            wsdl=f'{url}/m3api/MIAccess?wsdl',
-            settings=Settings(strict=True),
-            transport=AsyncTransport(client=self.session))
+    def __init__(self, url, usr, pwd, semaphore=5, retry=False):
+        """Sends a call to the API and returns the result as a dictionary.
+
+        Upper case keyword arguments are considered input parameters.
+        Lower case keyword arguments are considered known api parameters.
+        Camel case keyword arguments are passed on to the api directly.
+
+        Known lower case arguments are:
+            cono: int
+            divi: int
+            maxrecs: int
+            program: str
+            transaction: str
+            returncols: str
+            returnmeta: bool|None
+            returnempty: bool
+
+        The semaphore definens how many requests the API is working on
+        asynchronously. If retry is set to True, the request will be
+        performed an additional time in case of a connection error,
+        or a timeout exception. If it fails again, the Exception will
+        be raised."""
+
+        session = AsyncSessionX(auth=(usr, pwd))
+        
+        wsdl = f'{url}/m3api/MIAccess?wsdl'
+        settings = Settings(strict=True)
+        transport = AsyncTransport(client=self.session, cache=cache)
+        client = AsyncClient(wsdl=wsdl, settings=settings, transport=transport)
+
+        self.retry = retry
+        self.client = client
+        self.session = session
         self.semaphore = asyncio.Semaphore(semaphore)
 
     async def __aenter__(self):
@@ -265,50 +315,22 @@ class AsyncMIClient:
         if not self.session.is_closed:
             self.session.aclose()
 
-    async def execute(
-            self,
-            program: str,
-            transaction: str,
-            maxrecs: int = 100,
-            cono: Optional[int] = None,
-            divi: Optional[int] = None,
-            user: Optional[str] = None,
-            returncols: list[str]|str = '',
-            meta: Optional[bool] = None,
-            retries: int = 1,
-            **kwargs
-    ) -> MIResult:
+    async def execute(self, program: str, transaction: str, **kwargs) -> MIResult:
+        params = mapparams(program=program, transaction=transaction, **kwargs)
 
-        if isinstance(returncols, str):
-            returncols = returncols.split(',')
-        
-        kwargs.update(
-            {
-                'program': program,
-                'transaction': transaction,
-                'maxrecs': maxrecs,
-                'cono': cono,
-                'divi': divi,
-                'user': user,
-                'returncols:': returncols,
-                'meta': meta,
-            }
-        )
-
-        params = make_params(**kwargs)
-        logger.debug(f'{program}:{transaction}:{params}')
-        
         async with self.semaphore:
             try:
-                return await self.client.service['Execute'](params)
+                result = await self.client.service['Execute'](params)
 
             except (httpx.TimeoutException, httpx.ConnectError) as error:
-                if retries:
-                    kwargs['retries'] -= 1
-                    return await self.execute(**kwargs)
+                if self.retry:
+                    await asyncio.sleep(1)
+                    result =  await self.execute(**params)
                 
                 else:
                     raise error
+        
+        return result
 
     async def progs(self):
         return await self.client.service.ListPrograms()
@@ -318,10 +340,11 @@ class AsyncMIClient:
 
 
 class MPDClient:
-    def __init__(self, url, usr, pwd):
+    def __init__(self, url, usr, pwd, service: str):
         self.auth = HTTPBasicAuth(usr, pwd)
         self.session = Session()
         self.session.auth = self.auth
+        self.service = service
         self.url = url
 
     def __enter__(self):
@@ -338,7 +361,6 @@ class MPDClient:
         self.session.close()
 
     def execute(self, service: str, operation: str, **kwargs):
-        logger.debug(f'{operation}:{kwargs}')
         client = self.client(f"{self.url}/mws-ws/services/{service}?wsdl")
         return getattr(client.service, operation)(kwargs)
 
@@ -348,13 +370,15 @@ class MPDClient:
 
 
 class AsyncMPDClient:
-    def __init__(self, url, usr, pwd, service: str, semaphore=5):
+    def __init__(self, url, usr, pwd, service: str, semaphore=5, retry=False):
         self.service: str = service
         self.session: AsyncSessionX = AsyncSessionX(auth=(usr, pwd))
         self.client: AsyncClient = AsyncClient(
             wsdl=f"{url}/mws-ws/services/{service}?wsdl",
             settings=Settings(strict=True),
             transport=AsyncTransport(client=self.session))
+
+        self.retry = retry
         self.semaphore: asyncio.Semaphore = asyncio.Semaphore(semaphore)
 
     async def __aenter__(self):
@@ -368,34 +392,31 @@ class AsyncMPDClient:
         if not self.session.is_closed:
             self.session.aclose()
 
-    async def execute(self, operation: str, retries=1, **kwargs):
-        async with self.semaphore:
-            logging.getLogger(__name__).debug(f'{operation}:{kwargs}')
-            
+    async def execute(self, operation: str, **kwargs):
+        async with self.semaphore:            
             try:
                 return await self.client.service[operation](kwargs)
 
             except (httpx.TimeoutException, httpx.ConnectError) as error:
-                if retries:
-                    return await self.execute(operation, retries=retries-1, **kwargs)
-                
-                else:
-                    raise error
+                if self.retry:
+                    await asyncio.sleep(1)
+                    return await self.execute(operation, **kwargs)
                 
 
-class ClientContructor:
-    def __init__(self, url: str, usr: str, pwd: str):
-        self.endpoint = (url, usr, pwd)
+class ClientFactory:
+    def __init__(self, url: str, usr: str, pwd: str, retry=False):
+        self.endpoint = Endpoint(url, usr, pwd)
+        self.retry = retry
         
     @classmethod
-    def from_endpoint(cls, key: str) -> 'ClientContructor':
+    def from_endpoint(cls, key: str) -> Self:
         return cls(*endpoint_get(key))
 
     def async_mi(self, semaphore: Optional[int] = 5) -> AsyncMIClient:
-        return AsyncMIClient(*self.endpoint, semaphore)
+        return AsyncMIClient(*self.endpoint, semaphore, self.retry) #type: ignore
 
     def async_mpd(self, service, semaphore: Optional[int] = 5) -> AsyncMPDClient:
-        return AsyncMPDClient(*self.endpoint, service, semaphore)
+        return AsyncMPDClient(*self.endpoint, service, semaphore, self.retry) #type: ignore
 
     def mi(self) -> MIClient:
         return MIClient(*self.endpoint)
@@ -559,50 +580,37 @@ def to_dclass(mi_result: MIResult, frozen=True) -> Iterable[Any]:
 
 
 def cli():
-    parser = argparse.ArgumentParser('m3api')
-    parser.add_argument('action', choices=['endpoint', 'endpoint-delete'])
+    key = input('Enter endpoint key: ')
 
-    args = parser.parse_args()
+    if key.strip() == '':
+        return
 
-    match args.action:
-        case 'endpoint':
-            key = input('Enter endpoint key: ')
+    try:
+        endpoint = endpoint_get(key)
 
-            if key.strip() == '':
-                return
-
-            try:
-                endpoint = endpoint_get(key)
-
-            except KeyError:
-                endpoint = Endpoint('', '', '')
+    except KeyError:
+        endpoint = Endpoint('', '', '')
             
-            try:
-                URL = input(f'URL [{endpoint.url}]: ')
-                USR = input(f'USR [{endpoint.usr}]: ')
-                PWD = getpass.getpass(f'PWD [{"*"*len(endpoint.pwd)}]: ')
-
-                URL = URL if URL != '' else endpoint.url
-                USR = USR if USR != '' else endpoint.usr
-                PWD = PWD if PWD != '' else endpoint.pwd
+        try:
+            URL = input(f'URL [{endpoint.url}]: ')
+            USR = input(f'USR [{endpoint.usr}]: ')
+            PWD = getpass.getpass(f'PWD [{"*"*len(endpoint.pwd)}]: ')
+            
+            URL = URL if URL != '' else endpoint.url
+            USR = USR if USR != '' else endpoint.usr
+            PWD = PWD if PWD != '' else endpoint.pwd
                     
-            except Exception as error:
-                raise error
+        except Exception as error:
+            raise error
 
-            else:
-                endpoint_set(key, URL, USR, PWD)
-                print(f'Endpoint "{key}" saved!')
+        else:
+            endpoint_set(key, URL, USR, PWD)
+            print(f'Endpoint "{key}" saved!')
 
-        case 'endpoint-delete':
-            key = input('Enter endpoint key: ')
-            try:
-                endpoint_del(key)
 
-            except:
-                print(f'Could not delete key "{key}"')
-
-            else:
-                print(f'Deleted endpoint with key "{key}"')
+################################################################################
+### Main                                                                     ###
+################################################################################
 
 
 if __name__ == '__main__':
